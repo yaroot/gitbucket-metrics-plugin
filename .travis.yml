@@ -1,0 +1,20 @@
+language: scala
+jdk:
+- oraclejdk8
+script:
+- sbt package
+- cp target/scala-*/*.jar .
+cache:
+  directories:
+  - "$HOME/.ivy2"
+  - "$HOME/.sbt"
+deploy:
+  provider: releases
+  api_key:
+    secure: NZj5YvvV0os1bHqDxgZkB13HOBjQ2CrJGLAz0zCKeJNx+tS8mYg4Yil2Vztt2Zxo1BZYDu0DZ7gaBQlEsXq20gK0iRSJsbgH+rMeROWqih4pefyixssZeAoZGc02/lJZeOAU6oDLp39W+M2689Q2MvMab/vfR1ZcxXCrQqHl2G8eFwHnJxx8xGqWHlflYNNlcZCHnwcHq9t8+NHA8FRPmr+M5JlHmTzfuFerkQCYKuTu0ZIbrVfYKoG9TYLjHrSdhhYLiylhQaAtwosFvfoPIL7SGdb9NrhytGX416hOSAIhZG/Sx1ThGokgnngPtNFn8ePETn7GbiXYrYQLNhDx/+Af5wZWbblQrqBf8XiI0m+00Iaj7nLFT3IWsthqR0pkW63EDYll3BtP3yBStuVu4pyXoDLv+V0s1zq0l7pxrSYPfD3B4sI2MUHW/hRACWuxJlrucjp4IujWiMcujguRv4/iDM5yXJqZH3qVSeYVRK0JeF6Ij3DaBBc4Kwl/nVMZwlAg5HlV9/jdca0Ewlnw+7ciWFHof1atoeypkQsTr/iTZnwbELOdeBZqbTIm3zXAQv7ytf5D+k3YKEzxUV/7ftKyLeIz96eownmbiH+DAIycHznPwVe8EwUEuUKmlxHENOMwVWYQx3bSptRx96FvNHFU7rCQoLCrJJFujdpnlfE=
+  file_glob: true
+  file: gitbucket-metrics-plugin_*.jar
+  skip_cleanup: true
+  on:
+    repo: yaroot/gitbucket-metrics-plugin
+    tags: true
