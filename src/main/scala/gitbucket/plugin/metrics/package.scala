@@ -20,7 +20,7 @@ class RepositoryMetrics {
   import RepositoryMetrics._
 
   private val closed = new AtomicBoolean(false)
-  def isClosed = closed.get()
+  def isClosed: Boolean = closed.get()
 
   // any IO related operation should be run on this threadpool
   // assuming single thread is okay for everyone
@@ -36,7 +36,7 @@ class RepositoryMetrics {
   }
 
   // we execute everything on the scheduler, so it's fine that `f` throws exception
-  def schedule(f: () => Unit): Scheduled = {
+  def runPeriodically(f: () => Unit): Scheduled = {
     val len = FIXED_DELAY.length
     val unit = FIXED_DELAY.unit
 
@@ -127,7 +127,7 @@ class RepositoryMetrics {
     }
     val mbean = new RepoSize(size.get(), refresh)
 
-    val cancel = schedule(refresh)
+    val cancel = runPeriodically(refresh)
 
     // initialize the value before publishing
     refresh()
