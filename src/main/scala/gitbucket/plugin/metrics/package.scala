@@ -1,43 +1,79 @@
 package gitbucket.plugin.metrics
 
 import java.lang.management.ManagementFactory
-import java.nio.file.{ Path, Paths }
+import java.nio.file.{ Files, Path, Paths }
+import java.util
 import java.util.concurrent.ScheduledThreadPoolExecutor
-import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.{ AtomicBoolean, AtomicLong }
 import javax.management.{ MBeanServer, ObjectName }
 
+import gitbucket.core.model.Profile
+import gitbucket.core.plugin.RepositoryHook
+import gitbucket.core.service.{ AccountService, RepositoryService }
 import gitbucket.core.util.Directory
 import org.apache.commons.io.FileUtils
 
 import scala.concurrent.duration._
+import scala.util.Try
 
-/*
- the lifecycle is rather simple:
-   - upon start, we create a `ScheduledThreadPoolExecutor` for running periodic/io-related tasks
-   - during shutdown, we close the executor
-
- TODO:
- - list all repos & related resources (LFS/uploads)
-*/
 class RepositoryMetrics {
   import RepositoryMetrics._
 
-  // we run any IO related task on this executor
+  private val closed = new AtomicBoolean(false)
+  def isClosed = closed.get()
+
+  // any IO related operation should be run on this threadpool
+  // assuming single thread is okay for everyone
   val scheduledExecutor = new ScheduledThreadPoolExecutor(1)
 
-  val mbeanServer = defaultMBeanServer()
-  @volatile var mbeans = Map.empty[ObjectName, CleanUp]
+  val mbeanServer: MBeanServer = defaultMBeanServer()
+  @volatile var registeredMBeans = Map.empty[ObjectName, CleanUp]
+  @volatile var repoBeans = Map.empty[(String, String), Vector[ObjectName]] // (user, repo) -> [mbean names]
+
+  def run(runnable: Runnable): Unit = {
+    if (!isClosed)
+      scheduledExecutor.execute(runnable)
+  }
 
   // we execute everything on the scheduler, so it's fine that `f` throws exception
   def schedule(f: () => Unit): Scheduled = {
     val len = FIXED_DELAY.length
     val unit = FIXED_DELAY.unit
 
-    scheduledExecutor.execute(() => f())
     val delay = scheduledExecutor.scheduleAtFixedRate(() => f(), len, len, unit)
 
     // return for cancellation
     () => delay.cancel(false)
+  }
+
+  def registerRepo(user: String, repo: String): Unit = {
+    if (!isClosed) {
+      val objectNames = Vector(
+        "git" -> Directory.getRepositoryDir _,
+        "wiki" -> Directory.getWikiRepositoryDir _,
+        "misc" -> Directory.getRepositoryFilesDir _
+      ).map {
+          case (typ, pf) =>
+            // create and register mbean, return object name for cancellation
+            val name = repoName("RepositorySize", user, repo, typ)
+            val path = pf(user, repo).toPath.toAbsolutePath
+            val (repoSize, cancel) = createRepoSize(path)
+            registerMBean(repoSize, name, () => cancel.cancel())
+            name
+        }
+
+      repoBeans += ((user, repo) -> objectNames)
+    }
+  }
+
+  def deregisterRepo(user: String, repo: String): Unit = {
+    try {
+      repoBeans.get(user -> repo).foreach(_.foreach {
+        name => Try(unregisterMBean(name))
+      })
+    } finally {
+      repoBeans -= (user -> repo)
+    }
   }
 
   def registerMBean(obj: Object, name: ObjectName, cleanup: CleanUp): Unit = {
@@ -46,56 +82,89 @@ class RepositoryMetrics {
     }
     val instance = mbeanServer.registerMBean(obj, name)
     val name0 = Option(instance).map(_.getObjectName).getOrElse(name)
-    mbeans += (name0 -> cleanup)
+    registeredMBeans += (name0 -> cleanup)
   }
 
   def unregisterMBean(name: ObjectName): Unit = {
     try {
-      mbeans.get(name).foreach(_.cleanup())
+      registeredMBeans.get(name).foreach(_.cleanup())
     } finally {
-      mbeans -= name
+      registeredMBeans -= name
       mbeanServer.unregisterMBean(name)
     }
   }
 
   def initialize(): Unit = {
-    registerTotal()
+    run(() => registerTotalSize())
+    run(() => initializeUserRepos())
   }
 
-  def registerTotal(): Unit = {
-    val atomicLong = new AtomicLong()
-    val refresh = () => atomicLong.set(directorySize(baseDir))
-    val mbean = new RepoSize(atomicLong.get(), refresh)
+  def initializeUserRepos(): Unit = {
+    listAllUserRepos().foreach { case (user, repo) => run(() => registerRepo(user, repo)) }
+  }
 
-    val scheduled = schedule(refresh)
+  def listAllUserRepos(): List[(String, String)] = {
+    import gitbucket.core.model.Profile.profile.blockingApi._
+    val userRepoService = new RepositoryService with AccountService
+    gitbucket.core.servlet.Database() withSession { implicit session =>
+      for {
+        user <- userRepoService.getAllUsers()
+        repo <- userRepoService.getRepositoryNamesOfUser(user.userName)
+      } yield (user.userName, repo)
+    }
+  }
 
-    registerMBean(mbean, objectName(SIZE_DOMAIN, "total"), () => scheduled.cancel())
+  def registerTotalSize(): Unit = {
+    val (repoSize, cancel) = createRepoSize(Paths.get(Directory.RepositoryHome).toAbsolutePath)
+    registerMBean(repoSize, totalName("TotalSize"), () => cancel.cancel())
+  }
+
+  def createRepoSize(path: Path): (RepoSize, Scheduled) = {
+    val size = new AtomicLong()
+    val refresh = () => {
+      Try { if (Files.exists(path)) size.set(directorySize(path)) }
+      ()
+    }
+    val mbean = new RepoSize(size.get(), refresh)
+
+    val cancel = schedule(refresh)
+
+    // initialize the value before publishing
+    refresh()
+
+    (mbean, cancel)
   }
 
   def shutdown(): Unit = {
-    try {
-      mbeans.keys.toVector.foreach(unregisterMBean)
-    } finally {
-      scheduledExecutor.shutdownNow()
+    closed.set(true)
+    registeredMBeans.foreach {
+      case (n, c) =>
+        Try(mbeanServer.unregisterMBean(n))
+        Try(c.cleanup())
     }
+    scheduledExecutor.shutdownNow()
   }
 }
 
 object RepositoryMetrics {
   val DOMAIN = "io.github.gitbucket"
-  val SIZE_DOMAIN = s"$DOMAIN.repository.size"
+  val SIZE_DOMAIN = s"$DOMAIN.repository"
   val FIXED_DELAY: FiniteDuration = 1.hour
-
-  def baseDir: Path = Paths.get(Directory.RepositoryHome).toAbsolutePath
 
   def defaultMBeanServer(): MBeanServer = ManagementFactory.getPlatformMBeanServer
 
   def directorySize(path: Path): Long = FileUtils.sizeOfDirectory(path.toFile)
 
-  def objectName(domain: String, name: String): ObjectName = {
-    val obj = new ObjectName(domain, "name", name)
-    if (obj.isPattern) new ObjectName(domain, "name", ObjectName.quote(name))
-    else obj
+  def repoName(name: String, user: String, repo: String, storage: String): ObjectName = {
+    val ht = new util.Hashtable[String, String]()
+    ht.put("user", user)
+    ht.put("repo", repo)
+    ht.put("storage", storage)
+    new ObjectName(name, ht)
+  }
+
+  def totalName(name: String): ObjectName = {
+    new ObjectName(SIZE_DOMAIN, "name", name)
   }
 }
 
@@ -117,3 +186,43 @@ class RepoSize(size: => Long, rf: () => Unit) extends RepoSizeMBean {
   override def refresh(): Unit = rf()
 }
 
+class MetricsHook(
+    create: (String, String) => Unit,
+    remove: (String, String) => Unit
+) extends RepositoryHook {
+  import Profile.profile.api.Session
+
+  override def created(owner: String, repository: String)(implicit session: Session): Unit = {
+    create(owner, repository)
+  }
+
+  override def deleted(owner: String, repository: String)(implicit session: Session): Unit = {
+    remove(owner, repository)
+  }
+
+  override def renamed(owner: String, repository: String, newRepository: String)(implicit session: Session): Unit = {
+    remove(owner, repository)
+    create(owner, newRepository)
+  }
+
+  override def transferred(owner: String, newOwner: String, repository: String)(implicit session: Session): Unit = {
+    remove(owner, repository)
+    create(newOwner, repository)
+  }
+
+  override def forked(owner: String, newOwner: String, repository: String)(implicit session: Session): Unit = {
+    create(newOwner, repository)
+  }
+}
+
+object MetricsHook {
+  def apply(svc: RepositoryMetrics): MetricsHook = {
+    val create = (user: String, repo: String) => {
+      svc.run(() => svc.registerRepo(user, repo))
+    }
+    val remove = (user: String, repo: String) => {
+      svc.run(() => svc.deregisterRepo(user, repo))
+    }
+    new MetricsHook(create, remove)
+  }
+}
