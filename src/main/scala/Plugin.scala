@@ -1,12 +1,9 @@
 
 import javax.servlet.ServletContext
 
-import gitbucket.core.controller.Context
-import gitbucket.core.plugin.{Link, PluginRegistry, RepositoryHook}
-import gitbucket.core.service.RepositoryService.RepositoryInfo
+import gitbucket.core.plugin.{PluginRegistry, RepositoryHook}
 import gitbucket.core.service.SystemSettingsService
 import gitbucket.plugin.metrics.{MetricsHook, RepositoryMetrics}
-import io.github.gitbucket.solidbase.migration.{LiquibaseMigration, SqlMigration}
 import io.github.gitbucket.solidbase.model.Version
 
 class Plugin extends gitbucket.core.plugin.Plugin {

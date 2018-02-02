@@ -2,8 +2,7 @@ package gitbucket.plugin.metrics
 
 import java.lang.management.ManagementFactory
 import java.nio.file.{ Files, Path, Paths }
-import java.util
-import java.util.concurrent.ScheduledThreadPoolExecutor
+import java.util.concurrent.{ LinkedBlockingQueue, ScheduledThreadPoolExecutor, ThreadPoolExecutor, TimeUnit }
 import java.util.concurrent.atomic.{ AtomicBoolean, AtomicLong }
 import javax.management.{ MBeanServer, ObjectName }
 
@@ -12,6 +11,7 @@ import gitbucket.core.plugin.RepositoryHook
 import gitbucket.core.service.{ AccountService, RepositoryService }
 import gitbucket.core.util.Directory
 import org.apache.commons.io.FileUtils
+import org.slf4j.{ Logger, LoggerFactory }
 
 import scala.concurrent.duration._
 import scala.util.Try
@@ -19,28 +19,38 @@ import scala.util.Try
 class RepositoryMetrics {
   import RepositoryMetrics._
 
+  protected val log: Logger = LoggerFactory.getLogger(this.getClass)
+
   private val closed = new AtomicBoolean(false)
   def isClosed: Boolean = closed.get()
 
-  // any IO related operation should be run on this threadpool
-  // assuming single thread is okay for everyone
-  val scheduledExecutor = new ScheduledThreadPoolExecutor(1)
+  // any IO related operation should be run on the threadpool (via run)
+  val scheduler = new ScheduledThreadPoolExecutor(1)
+  val executor = new ThreadPoolExecutor(1, 1, 0, TimeUnit.DAYS, new LinkedBlockingQueue[Runnable]())
 
   val mbeanServer: MBeanServer = defaultMBeanServer()
+
   @volatile var registeredMBeans = Map.empty[ObjectName, CleanUp]
   @volatile var repoBeans = Map.empty[(String, String), Vector[ObjectName]] // (user, repo) -> [mbean names]
 
-  def run(runnable: Runnable): Unit = {
-    if (!isClosed)
-      scheduledExecutor.execute(runnable)
+  def run(f: () => Unit): Unit = {
+    if (!isClosed) {
+      executor.execute(() => {
+        try {
+          f()
+        } catch {
+          case exc: Throwable =>
+            log.error("Execution error", exc)
+        }
+      })
+    }
   }
 
   // we execute everything on the scheduler, so it's fine that `f` throws exception
   def runPeriodically(f: () => Unit): Scheduled = {
     val len = FIXED_DELAY.length
     val unit = FIXED_DELAY.unit
-
-    val delay = scheduledExecutor.scheduleAtFixedRate(() => f(), len, len, unit)
+    val delay = scheduler.scheduleAtFixedRate(() => run(f), len, len, unit)
 
     // return for cancellation
     () => delay.cancel(false)
@@ -55,7 +65,7 @@ class RepositoryMetrics {
       ).map {
           case (typ, pf) =>
             // create and register mbean, return object name for cancellation
-            val name = repoName("RepositorySize", user, repo, typ)
+            val name = repoName("RepositoryStorage", user, repo, typ)
             val path = pf(user, repo).toPath.toAbsolutePath
             val (repoSize, cancel) = createRepoSize(path)
             registerMBean(repoSize, name, () => cancel.cancel())
@@ -87,7 +97,7 @@ class RepositoryMetrics {
 
   def unregisterMBean(name: ObjectName): Unit = {
     try {
-      registeredMBeans.get(name).foreach(_.cleanup())
+      registeredMBeans.get(name).foreach(cleanup => cleanup())
     } finally {
       registeredMBeans -= name
       mbeanServer.unregisterMBean(name)
@@ -95,8 +105,8 @@ class RepositoryMetrics {
   }
 
   def initialize(): Unit = {
-    run(() => registerTotalSize())
-    run(() => initializeUserRepos())
+    run(initializeTotalSize _)
+    run(initializeUserRepos _)
   }
 
   def initializeUserRepos(): Unit = {
@@ -114,23 +124,20 @@ class RepositoryMetrics {
     }
   }
 
-  def registerTotalSize(): Unit = {
+  def initializeTotalSize(): Unit = {
     val (repoSize, cancel) = createRepoSize(Paths.get(Directory.RepositoryHome).toAbsolutePath)
-    registerMBean(repoSize, totalName("TotalSize"), () => cancel.cancel())
+    registerMBean(repoSize, totalName("TotalStorage"), () => cancel.cancel())
   }
 
   def createRepoSize(path: Path): (RepoSize, Scheduled) = {
     val size = new AtomicLong()
-    val refresh = () => {
-      Try { if (Files.exists(path)) size.set(directorySize(path)) }
-      ()
-    }
+    val refresh: Refresh = () => { if (Files.exists(path)) size.set(directorySize(path)) }
     val mbean = new RepoSize(size.get(), refresh)
 
-    val cancel = runPeriodically(refresh)
+    val cancel = runPeriodically(() => refresh())
 
     // initialize the value before publishing
-    refresh()
+    Try(refresh())
 
     (mbean, cancel)
   }
@@ -140,9 +147,10 @@ class RepositoryMetrics {
     registeredMBeans.foreach {
       case (n, c) =>
         Try(mbeanServer.unregisterMBean(n))
-        Try(c.cleanup())
+        Try(c())
     }
-    scheduledExecutor.shutdownNow()
+    scheduler.shutdownNow()
+    executor.shutdownNow()
   }
 }
 
@@ -156,24 +164,24 @@ object RepositoryMetrics {
   def directorySize(path: Path): Long = FileUtils.sizeOfDirectory(path.toFile)
 
   def repoName(name: String, user: String, repo: String, storage: String): ObjectName = {
-    val ht = new util.Hashtable[String, String]()
-    ht.put("user", user)
-    ht.put("repo", repo)
-    ht.put("storage", storage)
-    new ObjectName(name, ht)
+    new ObjectName(s"$SIZE_DOMAIN:name=$name,user=$user,repo=$repo,storage=$storage")
   }
 
   def totalName(name: String): ObjectName = {
-    new ObjectName(SIZE_DOMAIN, "name", name)
+    new ObjectName(s"$SIZE_DOMAIN:name=$name")
   }
 }
 
 trait CleanUp {
-  def cleanup(): Unit
+  def apply(): Unit
 }
 
 trait Scheduled {
   def cancel(): Unit
+}
+
+trait Refresh {
+  def apply(): Unit
 }
 
 trait RepoSizeMBean {
@@ -181,7 +189,7 @@ trait RepoSizeMBean {
   def refresh(): Unit
 }
 
-class RepoSize(size: => Long, rf: () => Unit) extends RepoSizeMBean {
+class RepoSize(size: => Long, rf: Refresh) extends RepoSizeMBean {
   override def getSize: Long = size
   override def refresh(): Unit = rf()
 }
