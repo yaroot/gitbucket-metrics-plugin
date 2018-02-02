@@ -61,8 +61,7 @@ class RepositoryMetrics {
       val objectNames = Vector(
         "git" -> Directory.getRepositoryDir _,
         "wiki" -> Directory.getWikiRepositoryDir _,
-        "misc" -> Directory.getRepositoryFilesDir _
-      ).map {
+        "misc" -> Directory.getRepositoryFilesDir _).map {
           case (typ, pf) =>
             // create and register mbean, return object name for cancellation
             val name = repoName("RepositoryStorage", user, repo, typ)
@@ -195,9 +194,8 @@ class RepoSize(size: => Long, rf: Refresh) extends RepoSizeMBean {
 }
 
 class MetricsHook(
-    create: (String, String) => Unit,
-    remove: (String, String) => Unit
-) extends RepositoryHook {
+  create: (String, String) => Unit,
+  remove: (String, String) => Unit) extends RepositoryHook {
   import Profile.profile.api.Session
 
   override def created(owner: String, repository: String)(implicit session: Session): Unit = {
